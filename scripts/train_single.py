@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,9 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--log-freq', default=10, type=int)
     parser.add_argument('--ckpt-freq', default=500, type=int)
     parser.add_argument('-s', '--seq-length', default=1024, type=int)
+    parser.add_argument('--dtype', choices=['fp32', 'bf16'], default='bf16')
+    parser.add_argument('--activation-checkpointing', action='store_true')
+    parser.add_argument('--grad-accumulation-steps', default=1, type=int)
     return parser
 
 
@@ -49,7 +53,10 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
     LOGGER.debug(args)
 
     device = torch.device('cuda')
-    dtype = torch.bfloat16
+    dtype = {
+        'fp32': torch.float32,
+        'bf16': torch.bfloat16,
+    }[args.dtype]
 
     torch.manual_seed(args.seed)
 
@@ -58,6 +65,11 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
     with device:
         config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
+        if args.activation_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={'use_reentrant': False}
+            )
+            LOGGER.info('Enabled activation/gradient checkpointing')
     LOGGER.info(f'Training {sum(p.numel() for p in model.parameters())} model parameters')
 
     model = torch.compile(model)  # type: ignore[assignment]
@@ -143,7 +155,9 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
         # NOTE: This is not standard. Normally you can just iterate directly over dataloader.
         #       We are doing this so we can explicitly measure the time it takes to generate a batch.
         batches = iter(dataloader)
-
+        optimizer.zero_grad(set_to_none=True)
+        tokens_since_log = 0
+        log_start_time = time.time()
         for i_step in range(len(dataloader)):
             # measure the time it takes to generate a batch and move it to the GPU
             with timers['data'], torch.no_grad():
@@ -156,34 +170,42 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
 
             with timers['forward']:
                 outputs = model(**batch)
+                loss = outputs.loss / args.grad_accumulation_steps
                 del batch
 
             with timers['backward']:
-                outputs.loss.backward()
+                loss.backward()
 
-            with timers['update']:
-                optimizer.step()
-                lr_scheduler.step()
-                # NOTE: set_to_none=True will de-allocate the gradients, saving us some memory
-                optimizer.zero_grad(set_to_none=True)
-
-            state['global_step'] += 1
-            state['epoch_step'] += 1
+            tokens_since_log += args.batch_size * args.seq_length
             state['running_loss'] += outputs.loss.item()
+            state['epoch_step'] += 1
             progress_bar.update(1)
 
-            if state['global_step'] % args.log_freq == 0:
+            is_update_step = (state['epoch_step'] % args.grad_accumulation_steps == 0)
+
+            if is_update_step:
+                with timers['update']:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                state['global_step'] += 1
+            
+
+            if is_update_step and state['global_step'] % args.log_freq == 0:
+                torch.cuda.synchronize()
+                elapsed_s = time.time() - log_start_time
                 tok_per_step = args.batch_size * args.seq_length
                 ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
                 info = {
                     'global_step': state['global_step'],
                     'lr': lr_scheduler.get_last_lr()[0],
-                    'running_loss': state['running_loss'] / args.log_freq,
+                    'running_loss': state['running_loss'] / (args.log_freq * args.grad_accumulation_steps),
                     'epoch': state['epoch'],
                     'epoch_progress': state['epoch_step'] / len(dataloader),
                     'num_batches_remaining': len(dataloader) - i_step,
                     **get_mem_stats(device),
-                    'tokens_per_s': 1000 * tok_per_step / ms_per_step,
+                    'tokens_per_s': tokens_since_log / elapsed_s,
                     'time/total': ms_per_step,
                     **{f'time/{k}': timer.avg_elapsed_ms() for k, timer in timers.items()},
                 }
@@ -194,8 +216,10 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
                 state['running_loss'] = 0
                 for t in timers.values():
                     t.reset()
+                tokens_since_log = 0
+                log_start_time = time.time()
 
-            if is_experiment and state['global_step'] % args.ckpt_freq == 0:
+            if is_experiment and is_update_step and state['global_step'] % args.ckpt_freq == 0:
                 LOGGER.info('Saving checkpoint.')
                 torch.save(optimizer.state_dict(), exp_dir / 'optimizer.pt')
                 torch.save(model.state_dict(), exp_dir / 'model.pt')
