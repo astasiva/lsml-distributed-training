@@ -170,7 +170,7 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
         # We need to do this so we shuffle differently on each epoch in a reproducible way
         dataloader.sampler.set_epoch(state['epoch'])  # type: ignore[attr-defined]
         batches = iter(dataloader)
-
+        optimizer.zero_grad(set_to_none=True)
         for i_step in range(len(dataloader)):
             # measure the time it takes to generate a batch and move it to the GPU
             with timers['data'], torch.no_grad():
@@ -186,25 +186,30 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901, PLR0915, PLR0912
                 del batch  # NOTE: to save memory for backwards pass
 
             with timers['backward']:
-                outputs.loss.backward()
+                loss = outputs.loss / args.grad_accumulation_steps
+                loss.backward()
 
-            with timers['update']:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            state['global_step'] += 1
-            state['epoch_step'] += 1
             state['running_loss'] += outputs.loss.item()
+            state['epoch_step'] += 1
             progress_bar.update(1)
+            is_update_step = state['epoch_step'] % args.grad_accumulation_steps == 0
 
-            if state['global_step'] % args.log_freq == 0:
-                tok_per_step = world_size * args.batch_size * args.seq_length
+            if is_update_step:
+                with timers['update']:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                state['global_step'] += 1
+
+            
+            if is_update_step and state['global_step'] % args.log_freq == 0:
+                tok_per_step = world_size * args.batch_size * args.seq_length * args.grad_accumulation_steps
                 ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
                 info = {
                     'global_step': state['global_step'],
                     'lr': lr_scheduler.get_last_lr()[0],
-                    'running_loss': state['running_loss'] / args.log_freq,
+                    'running_loss': state['running_loss'] / (args.log_freq * args.grad_accumulation_steps),
                     'epoch': state['epoch'],
                     'epoch_progress': state['epoch_step'] / len(dataloader),
                     'num_batches_remaining': len(dataloader) - i_step,
